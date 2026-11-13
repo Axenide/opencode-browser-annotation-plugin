@@ -31,7 +31,7 @@ Add to your OpenCode 2 config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugins": ["opencode-browser-annotation-plugin"]
+  "plugins": ["git+https://github.com/Axenide/opencode-browser-annotation-plugin.git#main"]
 }
 ```
 

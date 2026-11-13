@@ -16,16 +16,17 @@
     "url": "git+https://github.com/Axenide/opencode-browser-annotation-plugin.git"
   },
   "type": "module",
-  "main": "./dist/plugin.js",
-  "module": "./dist/plugin.js",
-  "types": "./dist/plugin.d.ts",
+  "main": "./src/plugin.ts",
+  "module": "./src/plugin.ts",
+  "types": "./src/plugin.ts",
   "exports": {
     ".": {
-      "types": "./dist/plugin.d.ts",
-      "default": "./dist/plugin.js"
+      "types": "./src/plugin.ts",
+      "default": "./src/plugin.ts"
     }
   },
   "files": [
+    "src",
     "dist",
     "extension",
     "skills",
