@@ -177,7 +177,7 @@ for a quick health check and to list/target sessions.
 ```bash
 npm install
 npm run typecheck
-npm run build      # emits dist/plugin.js
+npm run compile    # emits dist/plugin.js
 ```
 
 The plugin source is `src/plugin.ts`; the extension is plain MV3 in `extension/`.
