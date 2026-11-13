@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Plugin, PluginInput } from "@opencode-ai/plugin";
+import { Plugin as V2Plugin } from "@opencode/plugin";
+import type { Plugin as V1Plugin, PluginInput } from "@opencode-ai/plugin";
 
 /**
  * opencode-browser-annotation-plugin
@@ -210,9 +212,44 @@ interface SessionInfo {
   directory?: string;
 }
 
-export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: PluginInput) => {
+interface RuntimeServices {
+  directory: string;
+  listSessions(): Promise<SessionInfo[]>;
+  inject(sessionID: string, prompt: string): Promise<void>;
+  log(level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>): void;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseSessions(value: unknown, directory: string): SessionInfo[] {
+  const rows = Array.isArray(value)
+    ? value
+    : isRecord(value) && Array.isArray(value.data)
+      ? value.data
+      : [];
+
+  return rows
+    .filter((row): row is Record<string, unknown> => isRecord(row))
+    .filter((row) => typeof row.id === "string" && !row.parentID)
+    .map((row) => {
+      const time = isRecord(row.time) ? row.time : {};
+      const location = isRecord(row.location) ? row.location : {};
+      return {
+        id: row.id as string,
+        title: typeof row.title === "string" ? row.title : (row.id as string),
+        updated: typeof time.updated === "number" ? time.updated : 0,
+        directory: typeof location.directory === "string" ? location.directory : directory,
+      };
+    });
+}
+
+function createRuntime(services: RuntimeServices) {
   const host = envHost();
   const port = envPort();
+  const { directory, log } = services;
+  const peerID = `${process.pid}-${randomUUID()}`;
 
   let activeSessionID: string | null = null;
   let server: Server | null = null; // the shared endpoint (DEFAULT_PORT), if we won it
@@ -220,6 +257,8 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
   let peerPort = 0;
   let peerFile: string | null = null;
   let registryTimer: ReturnType<typeof setInterval> | null = null;
+  let started = false;
+  let stopped = false;
 
   const PEER_STALE_MS = 30 * 1000; // a peer file older than this is treated as dead
   const REGISTRY_REFRESH_MS = 10 * 1000;
@@ -231,25 +270,10 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
   // The picker shows every recent session merged across all instances.
   const RECENT_MAX = 25;
 
-  const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
-    void client.app
-      .log({ body: { service: "browser-annotation", level, message, extra } })
-      .catch(() => {});
-  };
-
   /** Sessions owned by THIS OpenCode process (its own in-process server). */
   async function localSessions(): Promise<SessionInfo[]> {
     try {
-      const res = (await client.session.list({})) as unknown;
-      const rows: any[] = Array.isArray(res) ? res : Array.isArray((res as any)?.data) ? (res as any).data : [];
-      return rows
-        .filter((s) => s && typeof s.id === "string" && !s.parentID)
-        .map((s) => ({
-          id: s.id,
-          title: typeof s.title === "string" ? s.title : s.id,
-          updated: s.time?.updated ?? 0,
-          directory,
-        }));
+      return await services.listSessions();
     } catch (error) {
       log("warn", `session.list failed: ${error instanceof Error ? error.message : "unknown"}`);
       return [];
@@ -259,10 +283,7 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
   /** Inject into a session THIS process owns. */
   async function localInject(sessionID: string, annotations: Annotation[]): Promise<{ ok: boolean; error?: string }> {
     try {
-      await client.session.promptAsync({
-        path: { id: sessionID },
-        body: { parts: [{ type: "text", text: buildPrompt(annotations) }] },
-      });
+      await services.inject(sessionID, buildPrompt(annotations));
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : "session.prompt failed" };
@@ -424,7 +445,7 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
     if (!peerPort) return;
     try {
       const dir = registryDir();
-      peerFile = join(dir, `${process.pid}.json`);
+      peerFile = join(dir, `${peerID}.json`);
       const rec: PeerRecord = { pid: process.pid, port: peerPort, directory, updated: Date.now() };
       writeFileSync(peerFile, JSON.stringify(rec));
     } catch {
@@ -434,20 +455,27 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
 
   function startPeerServer(): void {
     const s = createServer(peerHandle);
+    peerServer = s;
     s.on("error", () => {
       /* ephemeral port clash is unlikely; if it happens, stay undiscoverable */
+      if (peerServer === s) peerServer = null;
     });
     s.listen(0, host, () => {
+      if (stopped) {
+        s.close();
+        return;
+      }
       const addr = s.address();
       peerPort = typeof addr === "object" && addr ? addr.port : 0;
-      peerServer = s;
       writePeerFile();
       registryTimer = setInterval(writePeerFile, REGISTRY_REFRESH_MS);
       log("info", `Annotation peer server on http://${host}:${peerPort} (pid ${process.pid})`);
     });
   }
 
-  function cleanupPeer(): void {
+  function dispose(): void {
+    if (stopped) return;
+    stopped = true;
     if (registryTimer) clearInterval(registryTimer);
     registryTimer = null;
     if (peerFile) {
@@ -459,6 +487,8 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
     }
     peerServer?.close();
     peerServer = null;
+    server?.close();
+    server = null;
   }
 
   // ——— Shared endpoint (the port the extension talks to) ———
@@ -510,7 +540,7 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
     sendJson(res, 404, { ok: false, error: "Not found" });
   }
 
-  function start(): void {
+  function startEndpoint(): void {
     if (server) return; // never double-listen (the plugin may init more than once)
     const s = createServer(handle);
     server = s; // claim synchronously so a re-entrant start() is a no-op
@@ -524,48 +554,156 @@ export const BrowserAnnotationPlugin: Plugin = async ({ client, directory }: Plu
       }
     });
     s.listen(port, host, () => {
-      log("info", `Browser annotation server listening on http://${host}:${port}`);
+      if (!stopped) log("info", `Browser annotation server listening on http://${host}:${port}`);
     });
   }
 
-  // Always start the peer server (every instance is discoverable); then try to
-  // win the shared endpoint. Whoever wins fans out to all peers.
-  startPeerServer();
-  start();
+  function start(): void {
+    if (started || stopped) return;
+    started = true;
+    startPeerServer();
+    startEndpoint();
+  }
 
-  // Best-effort registry cleanup so a gone instance stops being advertised.
-  // (readPeers also reaps files whose pid is dead, as a backstop.)
-  for (const sig of ["exit", "SIGINT", "SIGTERM"] as const) {
-    process.once(sig, cleanupPeer);
+  function onPrompt(sessionID: string | undefined): void {
+    if (!sessionID) return;
+    activeSessionID = sessionID;
+    activeIDs.add(sessionID);
+  }
+
+  function onV1Event(value: unknown): void {
+    if (!isRecord(value) || typeof value.type !== "string") return;
+    const properties = isRecord(value.properties) ? value.properties : {};
+    const info = isRecord(properties.info) ? properties.info : {};
+    const id = typeof info.id === "string" ? info.id : properties.sessionID;
+    if (typeof id !== "string") return;
+    if (value.type === "session.deleted") {
+      activeIDs.delete(id);
+      if (id === activeSessionID) activeSessionID = null;
+      return;
+    }
+    if (["session.created", "session.updated", "session.status", "session.idle"].includes(value.type)) {
+      activeIDs.add(id);
+    }
+  }
+
+  function onV2Event(value: unknown): void {
+    if (!isRecord(value) || typeof value.type !== "string") return;
+    const data = isRecord(value.data) ? value.data : {};
+    const id = data.sessionID;
+    if (typeof id !== "string") return;
+    if (value.type === "session.deleted") {
+      activeIDs.delete(id);
+      if (id === activeSessionID) activeSessionID = null;
+      return;
+    }
+    if (["session.created", "session.execution.started", "session.idle"].includes(value.type)) {
+      activeIDs.add(id);
+    }
+  }
+
+  return { start, dispose, onPrompt, onV1Event, onV2Event };
+}
+
+const legacyPlugin: V1Plugin = async ({ client, directory }: PluginInput) => {
+  const runtime = createRuntime({
+    directory,
+    async listSessions() {
+      return parseSessions(await client.session.list({}), directory);
+    },
+    async inject(sessionID, prompt) {
+      await client.session.promptAsync({
+        path: { id: sessionID },
+        body: { parts: [{ type: "text", text: prompt }] },
+      });
+    },
+    log(level, message, extra) {
+      void client.app.log({ body: { service: "browser-annotation", level, message, extra } }).catch(() => {});
+    },
+  });
+
+  try {
+    runtime.start();
+  } catch (error) {
+    runtime.dispose();
+    throw error;
   }
 
   return {
-    "chat.message": async (input) => {
-      if (input?.sessionID) {
-        activeSessionID = input.sessionID;
-        activeIDs.add(input.sessionID);
-      }
-    },
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        const id = event.properties.info.id;
-        if (id) activeIDs.add(id);
-      } else if (event.type === "session.updated") {
-        const id = event.properties.info.id;
-        if (id) activeIDs.add(id);
-      } else if (event.type === "session.status") {
-        const id = event.properties.sessionID;
-        if (id) activeIDs.add(id);
-      } else if (event.type === "session.idle") {
-        const id = event.properties.sessionID;
-        if (id) activeIDs.add(id);
-      } else if (event.type === "session.deleted") {
-        const id = event.properties.info.id;
-        activeIDs.delete(id);
-        if (id === activeSessionID) activeSessionID = null;
-      }
-    },
+    "chat.message": async (input) => runtime.onPrompt(input.sessionID),
+    event: async ({ event }) => runtime.onV1Event(event),
+    dispose: async () => runtime.dispose(),
   };
+};
+
+const v2Plugin = V2Plugin.define({
+  id: "opencode-browser-annotation-plugin",
+  async setup(ctx) {
+    const directory = ctx.location.directory;
+    const runtime = createRuntime({
+      directory,
+      async listSessions() {
+        const page = await ctx.session.list({ limit: 50, order: "desc", parentID: null, directory });
+        return page.data.map((session) => ({
+          id: session.id,
+          title: session.title ?? session.id,
+          updated: session.time.updated,
+          directory: session.location.directory,
+        }));
+      },
+      async inject(sessionID, prompt) {
+        await ctx.session.prompt({ sessionID, text: prompt });
+      },
+      log(level, message, extra) {
+        console[level]("[browser-annotation]", message, extra ?? {});
+      },
+    });
+
+    const promptRegistration = await ctx.session.hook("prompt", (event) => runtime.onPrompt(event.sessionID));
+    const controller = new AbortController();
+    const eventTask = (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({
+          types: ["session.created", "session.deleted", "session.execution.started", "session.idle"],
+          signal: controller.signal,
+        })) {
+          runtime.onV2Event(event);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.error("[browser-annotation] Event subscription failed", error);
+        }
+      }
+    })();
+
+    try {
+      runtime.start();
+    } catch (error) {
+      controller.abort();
+      try {
+        await promptRegistration.dispose();
+      } finally {
+        runtime.dispose();
+      }
+      await eventTask;
+      throw error;
+    }
+
+    return async () => {
+      controller.abort();
+      try {
+        await promptRegistration.dispose();
+      } finally {
+        runtime.dispose();
+      }
+      await eventTask;
+    };
+  },
+});
+
+export const BrowserAnnotationPlugin = {
+  ...v2Plugin,
+  server: legacyPlugin,
 };
 
 export default BrowserAnnotationPlugin;

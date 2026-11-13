@@ -27,7 +27,15 @@ public port, and SSH provides the auth and encryption.
 
 ### 1. Plugin (on the OpenCode host)
 
-Add to your OpenCode config (`~/.config/opencode/opencode.json`):
+Add to your OpenCode 2 config (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "plugins": ["opencode-browser-annotation-plugin"]
+}
+```
+
+OpenCode 2 reloads plugins when the config changes. For OpenCode 1.18.29 and later, use the V1 setting instead:
 
 ```json
 {
@@ -35,7 +43,7 @@ Add to your OpenCode config (`~/.config/opencode/opencode.json`):
 }
 ```
 
-Restart OpenCode. The plugin starts an HTTP server on `127.0.0.1:39517`.
+The plugin starts an HTTP server on `127.0.0.1:39517`.
 Configure with environment variables if needed:
 
 - `OPENCODE_ANNOTATION_PORT` (default `39517`)
@@ -53,8 +61,8 @@ cp node_modules/opencode-browser-annotation-plugin/skills/browser-annotation/SKI
    ~/.config/opencode/skills/browser-annotation/SKILL.md
 ```
 
-Restart OpenCode. The agent auto-loads this skill when an annotation arrives
-(the payload identifies itself and references the skill). Verify with
+OpenCode discovers this skill when it arrives (the payload identifies itself
+and references it). Verify with
 `opencode debug skill`.
 
 ### 3. Extension (in your desktop Chrome)
